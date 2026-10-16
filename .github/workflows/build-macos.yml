@@ -1,9 +1,16 @@
 name: Build (macOS)
 
-# macOS only for now. Produces a universal (Apple Silicon + Intel) .dmg and zipped .app.
-#   - every push to main and every pull request: test + build, artifacts attached to the run
-#   - pushing a tag like v1.0.0: also creates a draft GitHub release with the downloads
-#   - "Run workflow" button: build on demand from any branch
+# macOS only for now. Two kinds of build, so everyday pushes stay fast:
+#
+#   check build   every push to main and every pull request
+#                 Apple Silicon only, no LTO, just the .app    -> a few minutes
+#   release build a pushed tag like v1.0.0, or "Run workflow" with "release build" ticked
+#                 universal (Apple Silicon + Intel), fully optimized, .dmg + .app.zip
+#                 tags also create a draft GitHub release       -> slower, by design
+#
+# Why: the optimized profile (fat LTO, one codegen unit) made the app crate take ~9x longer to
+# compile, and a universal build does everything twice. Measured locally: a cold build took
+# 100s with the release profile and 35s without. GitHub's macOS runners are slower than a Mac.
 
 on:
   push:
@@ -11,6 +18,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_build:
+        description: "Full release build (universal, optimized) instead of the fast check build"
+        type: boolean
+        default: false
 
 # A newer push cancels an older in-progress run of the same branch/PR (never a tag/release build).
 concurrency:
@@ -22,13 +34,20 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0" # incremental compilation only bloats a cold CI cache
+  # Prebuilt Tauri CLI (downloaded, not compiled). Bump this when you want a newer CLI.
+  TAURI_CLI_VERSION: "2.12.3"
+  RELEASE_BUILD: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.release_build == true }}
 
 jobs:
   test:
     name: Test
     runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0" # skip debug info: faster compile, smaller cache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,6 +57,9 @@ jobs:
         with:
           workspaces: "src-tauri -> target"
           key: test
+          # Only main writes the cache. Pull requests still read it, but don't each spend a
+          # minute saving their own copy.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo fmt
         working-directory: src-tauri
@@ -48,12 +70,32 @@ jobs:
         run: cargo test --locked
 
   build:
-    name: Build universal app
+    name: Build app
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # Both targets are needed for a universal binary.
+      # Decided before the Rust cache step so the cache key reflects the build mode.
+      - name: Pick build mode
+        run: |
+          if [ "$RELEASE_BUILD" = "true" ]; then
+            {
+              echo "TARGET=universal-apple-darwin"
+              echo "BUNDLE_ARGS="                     # everything: .app and .dmg
+              echo "ARTIFACT=macos-universal"
+            } >> "$GITHUB_ENV"
+          else
+            {
+              echo "TARGET=aarch64-apple-darwin"
+              echo "BUNDLE_ARGS=--bundles app"        # the .dmg step is slow and not needed to check a build
+              echo "ARTIFACT=macos-arm64-check"
+              echo "CARGO_PROFILE_RELEASE_LTO=off"
+              echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
+            } >> "$GITHUB_ENV"
+          fi
+
+      # Both targets are installed either way (it takes seconds); a universal build needs both.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -61,24 +103,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "src-tauri -> target"
-          key: universal
+          key: ${{ env.RELEASE_BUILD == 'true' && 'release' || 'check' }}
+          # Main (including a manual release build run on main) writes the cache; tags and PRs read it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # The frontend is plain HTML/JS (no npm), so only the Tauri CLI is needed. Installing it
-      # from source takes minutes, so keep the binary between runs.
-      - name: Cache tauri-cli
-        id: tauri-cli
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-tauri
-          key: tauri-cli-v2-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Install tauri-cli
-        if: steps.tauri-cli.outputs.cache-hit != 'true'
-        run: cargo install tauri-cli --version "^2" --locked
+      # The frontend is plain HTML/JS (no npm). Only the Tauri CLI is needed, and compiling it from
+      # source takes minutes, so download the prebuilt release asset instead (~8 MB, seconds).
+      - name: Install Tauri CLI
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" = "arm64" ]; then triple=aarch64-apple-darwin; else triple=x86_64-apple-darwin; fi
+          url="https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/cargo-tauri-${triple}.zip"
+          if curl -fsSL --retry 3 -o "$RUNNER_TEMP/cargo-tauri.zip" "$url"; then
+            mkdir -p "$HOME/.cargo/bin"
+            unzip -o -q "$RUNNER_TEMP/cargo-tauri.zip" cargo-tauri -d "$HOME/.cargo/bin"
+            chmod +x "$HOME/.cargo/bin/cargo-tauri"
+          else
+            echo "::warning::Prebuilt Tauri CLI not available at $url; compiling it from source (slow)."
+            cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
+          fi
+          cargo tauri --version
 
       - name: Build
         working-directory: src-tauri
-        run: cargo tauri build --target universal-apple-darwin
+        # BUNDLE_ARGS is intentionally unquoted: it is either empty or "--bundles app".
+        run: cargo tauri build --target "$TARGET" $BUNDLE_ARGS
         env:
           # Ad-hoc signature ("-"): gives the bundle a valid signature without an Apple account.
           # To sign and notarize for real, replace this with the secrets below (Developer ID cert).
@@ -92,18 +141,18 @@ jobs:
 
       # Globs, not names, so renaming the product later doesn't break this.
       - name: Collect downloads
-        working-directory: src-tauri/target/universal-apple-darwin/release/bundle
+        working-directory: src-tauri/target/${{ env.TARGET }}/release/bundle
         run: |
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          cp dmg/*.dmg "$GITHUB_WORKSPACE/dist/"
+          if [ -d dmg ]; then cp dmg/*.dmg "$GITHUB_WORKSPACE/dist/"; fi
           for app in macos/*.app; do
             ditto -c -k --keepParent "$app" "$GITHUB_WORKSPACE/dist/$(basename "$app" .app).app.zip"
           done
           ls -lh "$GITHUB_WORKSPACE/dist"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: macos-universal
+          name: ${{ env.ARTIFACT }}
           path: dist/*
           if-no-files-found: error
           retention-days: 14
@@ -116,12 +165,12 @@ jobs:
     permissions:
       contents: write # create the release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          name: macos-universal
+          name: macos-universal # tags always run the release build
           path: dist
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true # review it, then publish from the GitHub UI
           generate_release_notes: true

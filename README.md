@@ -4,7 +4,7 @@ A clipboard manager and screenshot tool for macOS. It lives in your menu bar, re
 
 Built with [Tauri 2](https://tauri.app) (Rust) and a plain HTML/CSS/JS frontend. No Node, no bundler, no network access.
 
-**Version 1.0.0 · macOS only**
+**Version 1.0.1 · macOS only**
 
 ## Features
 
