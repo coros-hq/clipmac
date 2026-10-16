@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClipMac</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="vendor/highlight.min.js"></script>
+    <script type="module" src="main.js" defer></script>
+  </head>
+
+  <body>
+    <div class="window">
+      <!-- Sidebar -->
+      <aside class="sidebar" data-tauri-drag-region>
+        <nav class="nav" id="nav" aria-label="Filters"></nav>
+        <footer class="sidebar-foot">
+          <span id="count">0 items</span>
+          <span class="foot-actions">
+          <button class="icon-btn" id="privacy" aria-label="Auto-hide secrets" aria-pressed="true">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2l5 1.8v4.2c0 3-2.2 5-5 6-2.8-1-5-3-5-6V3.8z"/><path d="m5.8 8 1.7 1.7 2.9-3.1"/></svg>
+          </button>
+          <button class="icon-btn" id="clear" title="Clear all" aria-label="Clear all">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4.5h11M6 4.5V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M4 4.5l.6 8a1 1 0 0 0 1 .9h4.8a1 1 0 0 0 1-.9l.6-8"/></svg>
+          </button>
+          </span>
+        </footer>
+      </aside>
+
+      <!-- History list -->
+      <section class="list-pane">
+        <header class="toolbar" data-tauri-drag-region>
+          <label class="search">
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></svg>
+            <input id="search" type="text" placeholder="Search" autocomplete="off" spellcheck="false" />
+            <kbd>⌘F</kbd>
+          </label>
+          <label class="sort" title="Sort by">
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v10M5 13l-2-2M5 13l2-2M11 13V3M11 3 9 5M11 3l2 2"/></svg>
+            <select id="sort" aria-label="Sort by"></select>
+          </label>
+          <button class="icon-btn shot-btn" id="shot-btn" title="Screenshot" aria-label="Screenshot">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.5h2l1-1.5h5l1 1.5h2a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1z"/><circle cx="8" cy="9" r="2.4"/></svg>
+          </button>
+        </header>
+        <div class="shot-panel" id="shot-panel" hidden></div>
+        <div class="list" id="list" role="listbox" aria-label="Clipboard history"></div>
+      </section>
+
+      <!-- Preview -->
+      <section class="preview-pane" id="preview" aria-live="polite" data-tauri-drag-region></section>
+    </div>
+
+    <div class="editor" id="editor" hidden></div>
+
+    <div class="toast" id="toast" role="status"></div>
+  </body>
+</html>

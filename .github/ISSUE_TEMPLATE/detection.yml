@@ -1,0 +1,42 @@
+name: Secret detection — missed or false positive
+description: A secret wasn't hidden, or something harmless was hidden / treated as code
+labels: [detection]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## ⚠️ Never paste a real secret
+        Use a **made-up example** with the same shape (e.g. `sk-` followed by random letters), or describe the format. If a real secret leaked through, rotate it, and report any hiding failure privately via *Security → Report a vulnerability*.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What went wrong?
+      options:
+        - A secret was NOT hidden (missed detection)
+        - Something harmless WAS hidden (false positive)
+        - Text was wrongly shown as code (or code wasn't detected)
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Where was it?
+      options:
+        - Copied text
+        - A screenshot or image
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: Example (fake!)
+      description: A made-up sample that behaves the same way. For screenshots, describe the font, size and layout, or attach an image containing only fake data.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened?
+    validations:
+      required: false

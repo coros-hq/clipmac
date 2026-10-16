@@ -1,0 +1,128 @@
+name: Build (macOS)
+
+# macOS only for now. Produces a universal (Apple Silicon + Intel) .dmg and zipped .app.
+#   - every push to main and every pull request: test + build, artifacts attached to the run
+#   - pushing a tag like v1.0.0: also creates a draft GitHub release with the downloads
+#   - "Run workflow" button: build on demand from any branch
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push cancels an older in-progress run of the same branch/PR (never a tag/release build).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt # the Rust-snippet formatter tests use it
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          key: test
+
+      - name: cargo fmt
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  build:
+    name: Build universal app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Both targets are needed for a universal binary.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          key: universal
+
+      # The frontend is plain HTML/JS (no npm), so only the Tauri CLI is needed. Installing it
+      # from source takes minutes, so keep the binary between runs.
+      - name: Cache tauri-cli
+        id: tauri-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri
+          key: tauri-cli-v2-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install tauri-cli
+        if: steps.tauri-cli.outputs.cache-hit != 'true'
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build
+        working-directory: src-tauri
+        run: cargo tauri build --target universal-apple-darwin
+        env:
+          # Ad-hoc signature ("-"): gives the bundle a valid signature without an Apple account.
+          # To sign and notarize for real, replace this with the secrets below (Developer ID cert).
+          APPLE_SIGNING_IDENTITY: "-"
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}            # base64 .p12
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}  # "Developer ID Application: …"
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}                  # app-specific password
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # Globs, not names, so renaming the product later doesn't break this.
+      - name: Collect downloads
+        working-directory: src-tauri/target/universal-apple-darwin/release/bundle
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp dmg/*.dmg "$GITHUB_WORKSPACE/dist/"
+          for app in macos/*.app; do
+            ditto -c -k --keepParent "$app" "$GITHUB_WORKSPACE/dist/$(basename "$app" .app).app.zip"
+          done
+          ls -lh "$GITHUB_WORKSPACE/dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-universal
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true # review it, then publish from the GitHub UI
+          generate_release_notes: true
+          files: dist/*
