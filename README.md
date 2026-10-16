@@ -1,4 +1,4 @@
-<img width="1024" height="1024" alt="icon_512x512@2x" src="https://github.com/user-attachments/assets/29ad636e-bde2-4390-87ad-18f07119f31d" />
+<img width="59" height="58" alt="readme-icon-clipmac" src="https://github.com/user-attachments/assets/6b94cade-4380-49dc-be91-567cfc3acd8e" />
 
 
 # ClipMac
