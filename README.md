@@ -1,3 +1,6 @@
+<img width="1024" height="1024" alt="icon_512x512@2x" src="https://github.com/user-attachments/assets/29ad636e-bde2-4390-87ad-18f07119f31d" />
+
+
 # ClipMac
 
 A clipboard manager and screenshot tool for macOS. It lives in your menu bar, remembers what you copy for 24 hours, hides secrets automatically, and lets you capture, beautify and share screenshots.
