@@ -423,8 +423,109 @@ fn text_pending(text: String, auto_hide: bool) -> Pending {
     }
 }
 
+/// The pasteboard's image as PNG bytes. macOS screenshots copied with ⌃⌘⇧4 are put there as PNG
+/// only, which arboard (TIFF only) can't see; other apps may offer TIFF, converted here.
+#[cfg(target_os = "macos")]
+fn pasteboard_png() -> Option<Vec<u8>> {
+    use objc2::rc::autoreleasepool;
+    use objc2_app_kit::{
+        NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypePNG,
+        NSPasteboardTypeTIFF,
+    };
+    use objc2_foundation::NSDictionary;
+    autoreleasepool(|_| {
+        let pb = NSPasteboard::generalPasteboard();
+        // SAFETY: the pasteboard type constants are valid statics; the data is copied out at once.
+        if let Some(png) = unsafe { pb.dataForType(NSPasteboardTypePNG) } {
+            return Some(png.to_vec());
+        }
+        let tiff = unsafe { pb.dataForType(NSPasteboardTypeTIFF) }?;
+        let rep = NSBitmapImageRep::imageRepWithData(&tiff)?;
+        let png = unsafe {
+            rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+        }?;
+        Some(png.to_vec())
+    })
+}
+
+/// True if the pasteboard content is flagged as secret or temporary by the app that wrote it.
+/// Password managers (1Password, Bitwarden, KeePassXC, Apple Passwords…) follow the
+/// nspasteboard.org convention; such content must never enter the history.
+#[cfg(target_os = "macos")]
+fn pasteboard_is_concealed() -> bool {
+    use objc2::rc::autoreleasepool;
+    use objc2_app_kit::NSPasteboard;
+    const MARKERS: [&str; 3] = [
+        "org.nspasteboard.ConcealedType",
+        "org.nspasteboard.TransientType",
+        "com.agilebits.onepassword",
+    ];
+    autoreleasepool(|_| {
+        NSPasteboard::generalPasteboard()
+            .types()
+            .is_some_and(|types| {
+                types
+                    .iter()
+                    .any(|t| MARKERS.contains(&t.to_string().as_str()))
+            })
+    })
+}
+
+/// Bundle id prefixes of password managers. Many don't mark what they copy, so the app that
+/// is in front when the clipboard changes is checked too.
+#[cfg(target_os = "macos")]
+const PASSWORD_MANAGERS: [&str; 17] = [
+    "com.1password.",
+    "com.agilebits.",
+    "com.bitwarden.",
+    "org.keepassxc.",
+    "org.keepassx.",
+    "com.lastpass.",
+    "com.dashlane.",
+    "com.sinew.enpass",
+    "me.proton.pass",
+    "com.nordsec.nordpass",
+    "com.markmcguill.strongbox",
+    "com.callpod.keepermac",
+    "com.apple.keychainaccess",
+    "com.apple.passwords",
+    "com.apple.systempreferences", // Passwords pane before macOS 15
+    "com.siber.roboform",
+    "com.mseven.msecure",
+];
+
+fn is_password_manager(bundle_id: &str) -> bool {
+    let id = bundle_id.to_lowercase();
+    PASSWORD_MANAGERS.iter().any(|p| id.starts_with(p))
+}
+
+#[cfg(target_os = "macos")]
+fn frontmost_is_password_manager() -> bool {
+    use objc2_app_kit::NSWorkspace;
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|app| app.bundleIdentifier())
+        .is_some_and(|id| is_password_manager(&id.to_string()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn frontmost_is_password_manager() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pasteboard_is_concealed() -> bool {
+    false
+}
+
 /// Reads and analyzes whatever is on the pasteboard. Takes no lock: OCR can take a moment.
 fn read_pasteboard(cb: &mut Clipboard, auto_hide: bool) -> Option<Pending> {
+    #[cfg(target_os = "macos")]
+    if let Some(png) = pasteboard_png() {
+        if let Some((width, height)) = png_size(&png) {
+            return Some(image_pending(png, width, height, auto_hide));
+        }
+    }
     if let Ok(img) = cb.get_image() {
         let png = encode_png(&img)?;
         let mut p = image_pending(png, img.width as u32, img.height as u32, auto_hide);
@@ -450,9 +551,14 @@ fn watch(app: AppHandle) {
         let Ok(mut cb) = Clipboard::new() else { return };
         let shared = app.state::<Shared>();
         let mut since_prune = Duration::ZERO;
+        let mut manager_was_front = false;
         loop {
             thread::sleep(POLL);
             since_prune += POLL;
+            // Also counts the previous tick, so copying a password and switching apps at once is still caught.
+            let manager_front = frontmost_is_password_manager();
+            let from_manager = manager_was_front || manager_front;
+            manager_was_front = manager_front;
             let mut changed = false;
             let (new_content, auto_hide) = {
                 let mut s = shared.0.lock().unwrap();
@@ -467,7 +573,7 @@ fn watch(app: AppHandle) {
                 }
                 (new_content, s.settings.auto_hide)
             };
-            if new_content {
+            if new_content && !from_manager && !pasteboard_is_concealed() {
                 // Analysis (OCR) happens before the clip is stored, so it's never visible unredacted.
                 if let Some(pending) = read_pasteboard(&mut cb, auto_hide) {
                     shared.0.lock().unwrap().insert(pending);
@@ -600,7 +706,8 @@ unsafe extern "C" {
     fn CGRequestScreenCaptureAccess() -> bool;
 }
 
-/// True if Screen Recording is granted; otherwise triggers the system prompt.
+/// True if Screen Recording is granted; otherwise triggers the system prompt (macOS shows it
+/// only once per app, so the UI also offers a button that opens System Settings).
 fn screen_access() -> bool {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -614,10 +721,43 @@ fn screen_access() -> bool {
     true
 }
 
+/// Whether Screen Recording is granted, without prompting.
+#[tauri::command]
+fn screen_access_granted() -> bool {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        CGPreflightScreenCaptureAccess()
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+#[tauri::command]
 fn open_privacy_settings() {
     let _ = Command::new("open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
         .spawn();
+}
+
+/// macOS only applies a new Screen Recording grant after the app restarts.
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    app.restart();
+}
+
+/// Runs a capture started by a global shortcut. The window may be hidden, so failures are
+/// reported to it as an event (and the window is brought up for permission problems).
+fn capture_from_shortcut(app: &AppHandle, mode: &str) {
+    match capture_screenshot(app, mode) {
+        Ok(_) => {}
+        Err(e) if e == "busy" => {}
+        Err(e) => {
+            if e == PERMISSION_ERR {
+                show_window(app);
+            }
+            let _ = app.emit("screenshot-error", e);
+        }
+    }
 }
 
 fn screenshots_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -666,7 +806,6 @@ fn capture_screenshot(app: &AppHandle, mode: &str) -> Result<ShotResult, String>
     }
     let _guard = CaptureGuard;
     if !screen_access() {
-        open_privacy_settings();
         return Err(PERMISSION_ERR.into());
     }
     let shared = app.state::<Shared>();
@@ -1087,7 +1226,7 @@ fn register_shortcuts(app: &AppHandle, sc: &Shortcuts) -> Result<(), String> {
             if event.state() == ShortcutState::Pressed {
                 let (app, mode) = (app.clone(), mode.clone());
                 tauri::async_runtime::spawn_blocking(move || {
-                    let _ = capture_screenshot(&app, &mode);
+                    capture_from_shortcut(&app, &mode);
                 });
             }
         })
@@ -1283,7 +1422,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                     if let Some(mode) = id.strip_prefix("shot:") {
                         let (app, mode) = (app.clone(), mode.to_string());
                         tauri::async_runtime::spawn_blocking(move || {
-                            let _ = capture_screenshot(&app, &mode);
+                            capture_from_shortcut(&app, &mode);
                         });
                     } else if let Some(clip_id) = id.strip_prefix("clip:") {
                         let _ = copy_to_clipboard(
@@ -1352,6 +1491,9 @@ pub fn run() {
             set_favorite,
             clear_clips,
             take_screenshot,
+            screen_access_granted,
+            open_privacy_settings,
+            restart_app,
             get_settings,
             set_settings,
             format_rust,
@@ -1380,6 +1522,73 @@ pub fn run() {
 #[cfg(all(test, target_os = "macos"))]
 mod pipeline_tests {
     use super::*;
+
+    #[test]
+    fn recognizes_password_manager_apps() {
+        for id in [
+            "com.apple.Passwords",
+            "com.apple.keychainaccess",
+            "com.1password.1password",
+            "com.bitwarden.desktop",
+        ] {
+            assert!(is_password_manager(id), "{id}");
+        }
+        for id in [
+            "com.apple.Safari",
+            "com.apple.TextEdit",
+            "com.google.Chrome",
+        ] {
+            assert!(!is_password_manager(id), "{id}");
+        }
+    }
+
+    /// The system pasteboard is shared by the whole process; tests that use it take turns.
+    static PASTEBOARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn skips_concealed_pasteboard_content() {
+        let _lock = PASTEBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        use objc2_app_kit::NSPasteboard;
+        use objc2_foundation::{NSArray, NSString};
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        let marker = NSString::from_str("org.nspasteboard.ConcealedType");
+        unsafe {
+            pb.declareTypes_owner(&NSArray::from_slice(&[&*marker]), None);
+            pb.setString_forType(&NSString::from_str("hunter2"), &marker);
+        }
+        assert!(pasteboard_is_concealed());
+        pb.clearContents();
+        set_png(&[0u8; 4]).unwrap();
+        assert!(!pasteboard_is_concealed());
+    }
+
+    /// Screenshots copied with ⌃⌘⇧4 are PNG-only on the pasteboard; TIFF-only content must work too.
+    #[test]
+    fn reads_png_and_tiff_from_pasteboard() {
+        let _lock = PASTEBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeTIFF};
+        use objc2_foundation::NSData;
+        let mut img = image::RgbaImage::new(8, 6);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([200, 30, 30, 255]);
+        }
+        let mut png = Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let png = png.into_inner();
+
+        set_png(&png).unwrap();
+        assert_eq!(pasteboard_png().as_deref(), Some(&png[..]));
+
+        let mut tiff = Cursor::new(Vec::new());
+        img.write_to(&mut tiff, image::ImageFormat::Tiff).unwrap();
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        let data = NSData::with_bytes(&tiff.into_inner());
+        assert!(unsafe { pb.setData_forType(Some(&data), NSPasteboardTypeTIFF) });
+        let got = pasteboard_png().expect("TIFF converted to PNG");
+        assert_eq!(png_size(&got), Some((8, 6)));
+    }
 
     /// End-to-end: OCR a real image, find secrets, write the redacted copy.
     /// Runs only when SECRETS_TEST_PNG (input) and SECRETS_TEST_OUT (output) are set.

@@ -420,7 +420,7 @@ async function onSaved(id, mode) {
 const editor = createEditor({ root: $("#editor"), invoke, imageSrc, h, svg, toast, onSaved });
 
 // ───────── Screenshots ─────────
-const shot = { settings: { delay: 0, cursor: false, shadow: true, save_file: false, shortcuts: {} }, open: false, busy: false, recording: null };
+const shot = { settings: { delay: 0, cursor: false, shadow: true, save_file: false, shortcuts: {} }, open: false, busy: false, recording: null, noAccess: false };
 const MODES = [
   ["selection", "Selection"],
   ["window", "Window"],
@@ -531,6 +531,12 @@ function renderShotPanel() {
 
   $("#shot-panel").replaceChildren(
     h("div", { class: "panel-title" }, "Screenshot"),
+    shot.noAccess ? h("div", { class: "opts" },
+      h("div", { class: "opt" },
+        h("div", {}, h("div", {}, "Screen Recording is off"),
+          h("div", { class: "hint" }, "Turn on ClipMac in System Settings › Privacy & Security › Screen Recording, then restart ClipMac. If it's already listed, remove it with “−” and add it again.")),
+        h("div", {}, h("button", { class: "link", onclick: () => invoke("open_privacy_settings") }, "Open Settings"),
+          h("button", { class: "link", onclick: () => invoke("restart_app") }, "Restart ClipMac")))) : null,
     h("div", { class: "modes" },
       MODES.map(([mode, label]) =>
         h("button", { class: "mode", disabled: shot.busy, onclick: () => capture(mode) }, svg(mode, 22), h("span", {}, label)))),
@@ -556,6 +562,26 @@ function renderShotPanel() {
     h("div", { class: "panel-note" }, "Captured at full native resolution as lossless PNG. Esc cancels a selection."));
 }
 
+// Used for captures from the button and from global shortcuts (the "screenshot-error" event).
+function showShotError(e) {
+  if (String(e) === "screen-recording-permission") {
+    shot.noAccess = true;
+    setShotPanel(true);
+    renderShotPanel();
+    toast("Allow Screen Recording for ClipMac, then restart it", 5000);
+  } else {
+    toast("Screenshot failed");
+    console.error(e);
+  }
+}
+listen("screenshot-error", (ev) => showShotError(ev.payload));
+// Back from System Settings: re-check, so the notice goes away once it's granted.
+window.addEventListener("focus", async () => {
+  if (!shot.noAccess) return;
+  shot.noAccess = !(await invoke("screen_access_granted"));
+  if (shot.open) renderShotPanel();
+});
+
 async function capture(mode) {
   if (shot.busy) return;
   shot.busy = true;
@@ -573,12 +599,7 @@ async function capture(mode) {
     toast((r.saved ? `Screenshot copied · saved to ${r.saved}` : "Screenshot copied to Clipboard") + note, 2600);
   } catch (e) {
     if (String(e) === "busy") return; // a capture is already running
-    if (String(e) === "screen-recording-permission") {
-      toast("Allow Screen Recording in System Settings, then restart the app", 6000);
-    } else {
-      toast("Screenshot failed");
-      console.error(e);
-    }
+    showShotError(e);
   } finally {
     shot.busy = false;
   }
