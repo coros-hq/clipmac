@@ -172,9 +172,9 @@ export function createEditor({ root, invoke, imageSrc, h, svg, toast, onSaved })
   });
 
   const copyOut = () => run("Copy", async () => {
-    await invoke("copy_png", { png: await blobToBase64(await exportBlob()) });
+    const hidden = await invoke("copy_png", { png: await blobToBase64(await exportBlob()) });
     saveStyle(session.o);
-    toast("Edited image copied");
+    toast(hidden ? "Edited image copied · secrets hidden" : "Edited image copied");
   });
 
   // ── controls ──

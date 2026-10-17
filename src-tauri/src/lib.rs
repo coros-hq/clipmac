@@ -199,6 +199,21 @@ impl Store {
         }
     }
 
+    /// The image file that may leave the app (clipboard, drag, staged file). Unlike
+    /// `visible_path`, revealing a clip doesn't change it: a sensitive clip always goes out as
+    /// its redacted copy, and the full image only ever stays in the private store.
+    fn public_path(&self, c: &Clip) -> Result<PathBuf, String> {
+        if !c.sensitive {
+            return Ok(self.image_path(&c.id));
+        }
+        let redacted = self.redacted_path(&c.id);
+        if redacted.exists() {
+            Ok(redacted)
+        } else {
+            Err("redacted copy unavailable".into())
+        }
+    }
+
     fn write_redacted(&self, id: &str, redacted: Option<&[u8]>) {
         match redacted {
             Some(bytes) => {
@@ -656,8 +671,8 @@ fn copy_to_clipboard(s: &mut Store, id: &str) -> Result<(), String> {
         Kind::Text => cb
             .set_text(clip.text.unwrap_or_default())
             .map_err(|e| e.to_string())?,
-        // While secrets are hidden, the redacted image is what gets copied.
-        Kind::Image => set_png(&fs::read(s.visible_path(&clip)?).map_err(|e| e.to_string())?)?,
+        // Never the full image of a sensitive clip, even while it is revealed in the app.
+        Kind::Image => set_png(&fs::read(s.public_path(&clip)?).map_err(|e| e.to_string())?)?,
     }
     // Don't re-capture our own write.
     s.last_change = change_count();
@@ -966,14 +981,30 @@ fn save_edited(
     Ok(id)
 }
 
-/// Puts an edited image (base64 PNG) on the clipboard without saving it.
+/// Puts an edited image (base64 PNG) on the clipboard without saving it. The editor may have
+/// been showing a revealed image, so the result is scanned again and only a redacted copy
+/// reaches the pasteboard. Returns whether secrets were hidden.
 #[tauri::command]
-fn copy_png(png: String, state: State<Shared>) -> Result<(), String> {
+fn copy_png(png: String, state: State<Shared>) -> Result<bool, String> {
     let bytes = STANDARD.decode(png).map_err(|e| e.to_string())?;
+    let auto_hide = state.0.lock().unwrap().settings.auto_hide;
+    // OCR runs outside the lock.
+    let (findings, redacted) = if auto_hide {
+        scan_image(&bytes)
+    } else {
+        (Vec::new(), None)
+    };
+    let hidden = !findings.is_empty();
+    let out = if hidden {
+        // Fail closed: if the redacted copy couldn't be made, copy nothing.
+        redacted.ok_or("couldn't hide the secrets in this image")?
+    } else {
+        bytes
+    };
     let mut s = state.0.lock().unwrap();
-    set_png(&bytes)?;
+    set_png(&out)?;
     s.last_change = change_count(); // don't re-capture our own write
-    Ok(())
+    Ok(hidden)
 }
 
 // ───────── Using images as files ─────────
@@ -998,7 +1029,7 @@ fn image_clip(s: &Store, id: &str) -> Result<Clip, String> {
 /// receive a real file with a sensible name.
 fn staged_file(s: &Store, id: &str) -> Result<PathBuf, String> {
     let clip = image_clip(s, id)?;
-    let source = s.visible_path(&clip)?; // redacted while secrets are hidden
+    let source = s.public_path(&clip)?; // always the redacted copy for a sensitive clip
     drop_staged(id); // never leave an earlier (possibly unredacted) copy behind
     let dir = std::env::temp_dir().join("clipmac-files").join(id);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1522,6 +1553,47 @@ pub fn run() {
 #[cfg(all(test, target_os = "macos"))]
 mod pipeline_tests {
     use super::*;
+
+    fn solid_png(rgb: [u8; 3]) -> Vec<u8> {
+        let mut img = image::RgbaImage::new(8, 6);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([rgb[0], rgb[1], rgb[2], 255]);
+        }
+        let mut out = Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    /// Revealing a clip is for the app window only: what other apps can paste stays redacted.
+    #[test]
+    fn revealed_sensitive_image_never_reaches_the_pasteboard_unredacted() {
+        let _lock = PASTEBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("clipmac-test-{}", now_ms()));
+        let mut store = Store::load(dir.clone());
+        let (full, redacted) = (solid_png([200, 30, 30]), solid_png([24, 24, 26]));
+
+        let mut pending = image_pending(full.clone(), 8, 6, false);
+        pending.clip.sensitive = true;
+        pending.redacted = Some(redacted.clone());
+        let id = pending.clip.id.clone();
+        store.insert(pending);
+        store.set_revealed(&id, true);
+        assert!(store.clips[0].revealed);
+
+        // The app window may show the full image…
+        assert_eq!(
+            fs::read(store.visible_path(&store.clips[0]).unwrap()).unwrap(),
+            full
+        );
+        // …but the clipboard and staged files only get the redacted one.
+        copy_to_clipboard(&mut store, &id).unwrap();
+        assert_eq!(pasteboard_png().as_deref(), Some(&redacted[..]));
+        let staged = staged_file(&store, &id).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), redacted);
+
+        drop_staged(&id);
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn recognizes_password_manager_apps() {
