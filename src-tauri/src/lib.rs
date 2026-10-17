@@ -1511,7 +1511,25 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                // Hiding a full-screen window strands its Space as a black screen,
+                // so leave full screen first and hide once the animation is done.
+                if window.is_fullscreen().unwrap_or(false) {
+                    let _ = window.set_fullscreen(false);
+                    let w = window.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..40 {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            if !w.is_fullscreen().unwrap_or(false) {
+                                break;
+                            }
+                        }
+                        // let the exit animation settle before hiding
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        let _ = w.hide();
+                    });
+                } else {
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
